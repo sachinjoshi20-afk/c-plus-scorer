@@ -1,6 +1,6 @@
-"""C+ Scoring Engine (Robust V2.6) - SENSEX + NIFTY 100, non-BFSI.
-v2.6: flexible cash-flow row matching + retry on incomplete data
-      + recalibrated signals (SELL = broken/red-flag only).
+"""C+ Scoring Engine (Robust V2.7) - SENSEX + NIFTY 100, non-BFSI.
+v2.7: sane-scale gate on accruals (kills false SELL flags),
+      dual market-cap sources for FCF yield, ROCE display cap, D/E sanity.
 """
 import os, time, json, datetime as dt
 import numpy as np, pandas as pd, yfinance as yf
@@ -60,20 +60,24 @@ def fetch(sym, pledge_override):
     m["profit_3y"]  = (ni.iloc[0]/ni.iloc[3])**(1/3)-1 if len(ni)>=4 else np.nan
     m["sales_yoy"]  = rev.iloc[0]/rev.iloc[1]-1 if len(rev)>=2 else np.nan
     m["sales_3y"]   = (rev.iloc[0]/rev.iloc[3])**(1/3)-1 if len(rev)>=4 else np.nan
-    # --- Profitability ---
+    # --- Profitability (ROCE capped at 250% for credibility; ranks unaffected) ---
     ce = g(debt)+g(eq)-g(cash)
-    m["roce"] = g(ebit)/ce if ce else np.nan
+    roce_raw = g(ebit)/ce if ce else np.nan
+    m["roce"] = min(roce_raw, 2.5) if ok(roce_raw) else np.nan
     tax_rt = g(tax)/g(pretax) if g(pretax) else FALLBACK_TAX
-    roic = g(ebit)*(1-tax_rt)/ce if ce else np.nan
+    roic_raw = g(ebit)*(1-tax_rt)/ce if ce else np.nan
     mcap = info.get("marketCap") or np.nan
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    shares = info.get("sharesOutstanding")
+    mcap_alt = price*shares if (ok(price) and ok(shares)) else np.nan   # 2nd market-cap source
     e, d = mcap or 0.0, g(debt) or 0.0
     re_ = RISK_FREE + (info.get("beta") or 1.0)*EQUITY_RISK_PREMIUM
     rd = (g(intr)/d) if d else FALLBACK_COST_OF_DEBT
     wacc = (e/(e+d)*re_ + d/(e+d)*rd*(1-tax_rt)) if (e+d) else re_
-    m["roic_wacc"] = roic - wacc
+    m["roic_wacc"] = (min(roic_raw, 2.5) - wacc) if ok(roic_raw) else np.nan
     m["roe"] = g(ni)/g(eq) if g(eq) else np.nan
     m["opm"] = g(ebit)/g(rev) if g(rev) else np.nan
-    # --- Valuation: multi-candidate cross-validation ---
+    # --- Valuation: multi-candidate cross-validation (dual market-cap) ---
     m["pe"] = info.get("trailingPE") or np.nan
     ev_c = []
     e2e = info.get("enterpriseToEbitda")
@@ -88,20 +92,25 @@ def fetch(sym, pledge_override):
     rev_stmt_v = g(rev)
     info_fcf, info_rev = info.get("freeCashflow"), info.get("totalRevenue")
     cands = []
-    if ok(fcf_stmt) and ok(mcap) and mcap: cands.append(fcf_stmt/mcap)
-    if ok(info_fcf) and ok(mcap) and mcap: cands.append(info_fcf/mcap)
+    for mc in (mcap, mcap_alt):
+        if ok(fcf_stmt) and ok(mc) and mc: cands.append(fcf_stmt/mc)
+        if ok(info_fcf) and ok(mc) and mc: cands.append(info_fcf/mc)
     if ok(fcf_stmt) and ok(rev_stmt_v) and rev_stmt_v and ok(info_rev) and ok(mcap) and mcap:
         cands.append((fcf_stmt/rev_stmt_v)*(info_rev/mcap))
     m["fcf_yield"] = next((c for c in cands if 0.001 <= c <= 0.30), np.nan)
-    # --- Cash flow & forensics ---
+    # --- Cash flow & forensics (ACCRUALS NOW SANE-SCALE GATED) ---
     cogs_v = g(cogs)
     if not ok(cogs_v) or cogs_v <= 0: cogs_v = rev_stmt_v
     m["ccc"] = (g(inv)/cogs_v*365 + g(recv)/rev_stmt_v*365 - g(pay)/cogs_v*365) \
                if (ok(cogs_v) and ok(rev_stmt_v) and rev_stmt_v != 0) else np.nan
     m["fcf_sales"] = fcf_stmt/rev_stmt_v if (ok(fcf_stmt) and ok(rev_stmt_v) and rev_stmt_v != 0) else np.nan
-    m["accruals"] = (g(ni)-o)/g(assets) if (ok(g(ni)) and ok(o) and ok(g(assets)) and g(assets)) else np.nan
-    # --- Health / governance / momentum ---
-    m["de"] = (g(debt)/g(eq)) if g(eq) else (info.get("debtToEquity", 0) or 0)/100
+    ni0 = g(ni)
+    sane_ocf = ok(o) and ok(ni0) and ni0 != 0 and 0.05 <= abs(o/ni0) <= 20   # glitch detector
+    m["accruals"] = (ni0-o)/g(assets) if (sane_ocf and ok(g(assets)) and g(assets)) else np.nan
+    # --- Health / governance / momentum (D/E sanity) ---
+    de_raw = (g(debt)/g(eq)) if g(eq) else np.nan
+    if not ok(de_raw) or de_raw > 15: de_raw = (info.get("debtToEquity", 0) or 0)/100
+    m["de"] = de_raw
     m["int_cov"] = g(ebit)/g(intr) if (ok(g(intr)) and g(intr) > 0) else 999
     m["pledge"] = pledge_override
     try:
@@ -118,7 +127,7 @@ def main():
     rows = []
     for _, r in uni.iterrows():
         m = None
-        for attempt in (1, 2):                       # retry on incomplete data
+        for attempt in (1, 2):
             try:
                 m = fetch(r.ticker, 0.0)
                 if sum(ok(m.get(k)) for k in ("roce","opm","pe","fcf_yield")) >= 3:
@@ -140,7 +149,7 @@ def main():
         live[k+"_s"] = (pct*100 if k in HIGHER_BETTER else (1-pct)*100).fillna(50).clip(0,100)
     live["c_plus"] = sum(live[k+"_s"]*w for k, w in WEIGHTS.items())
     live["val_pillar"] = (live.rel_pe_s*.07 + live.rel_ev_s*.05 + live.fcf_yield_s*.08)/.20
-    def rec(x):                                       # RECALIBRATED v2.6
+    def rec(x):
         red = (x.pledge > 5) or (ok(x.de) and x.de > 2.5) or (ok(x.accruals) and x.accruals > 0.10)
         if red or x.c_plus < 50: return "SELL"
         if x.c_plus >= 80 and x.val_pillar >= 75: return "BUY"
