@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C+ Score Dashboard — SENSEX & NIFTY 100</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>C+ Score <span>Robust V2 · Non-BFSI Engine · SENSEX + NIFTY 100</span></h1>
+  <div id="updated"></div>
+  <div id="summary" class="summary"></div>
+</header>
+<main>
+  <div class="controls">
+    <input id="search" placeholder="Search ticker or company…">
+    <select id="signal">
+      <option value="">All signals</option>
+      <option>BUY</option><option>HOLD/WAIT</option>
+      <option>SELL</option><option>NOT SCORED (BFSI)</option>
+    </select>
+    <select id="sector"></select>
+  </div>
+  <div class="tablewrap">
+  <table>
+    <thead><tr>
+      <th>#</th>
+      <th data-key="ticker">Ticker ⇅</th>
+      <th data-key="name">Company ⇅</th>
+      <th data-key="sector">Sector ⇅</th>
+      <th data-key="c_plus">C+ Score ⇅</th>
+      <th data-key="recommendation">Signal ⇅</th>
+      <th>Reason</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  </div>
+  <p class="disclaimer">The C+ Score is an educational quantitative model computed from public financial data.
+  We are not SEBI/SEC-registered investment advisers. Nothing here is investment advice. Do your own research.</p>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
