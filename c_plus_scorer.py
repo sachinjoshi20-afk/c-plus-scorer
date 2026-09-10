@@ -1,6 +1,6 @@
-"""C+ Scoring Engine (Robust V2.5) - SENSEX + NIFTY 100, non-BFSI.
-v2.5: multi-candidate cross-validation for FCF Yield & EV/EBITDA
-      (defeats Yahoo currency/unit mismatches definitively).
+"""C+ Scoring Engine (Robust V2.6) - SENSEX + NIFTY 100, non-BFSI.
+v2.6: flexible cash-flow row matching + retry on incomplete data
+      + recalibrated signals (SELL = broken/red-flag only).
 """
 import os, time, json, datetime as dt
 import numpy as np, pandas as pd, yfinance as yf
@@ -26,6 +26,12 @@ def row(df, name):
     except Exception:
         return pd.Series(dtype=float)
 
+def first_row(df, names):
+    for n in names:
+        r = row(df, n)
+        if len(r): return r
+    return pd.Series(dtype=float)
+
 def ok(v):
     return v is not None and not (isinstance(v, float) and np.isnan(v))
 
@@ -39,7 +45,10 @@ def fetch(sym, pledge_override):
     ebit = row(fin,"EBIT") if "EBIT" in fin.index else row(fin,"Operating Income")
     intr, tax, pretax = row(fin,"Interest Expense"), row(fin,"Tax Provision"), row(fin,"Pretax Income")
     cogs = row(fin,"Cost Of Revenue")
-    ocf, capex = row(cf,"Operating Cash Flow"), row(cf,"Capital Expenditure")
+    ocf = first_row(cf, ["Operating Cash Flow","Cash Flow From Continuing Operating Activities",
+                         "Total Cash From Operating Activities","Free Cash Flow"])
+    fcf_row = row(cf, "Free Cash Flow")
+    capex = row(cf, "Capital Expenditure")
     eq, debt = row(bs,"Stockholders Equity"), row(bs,"Total Debt")
     cash, inv = row(bs,"Cash And Cash Equivalents"), row(bs,"Inventory")
     recv, pay = row(bs,"Receivables"), row(bs,"Payables And Accrued Expenses")
@@ -64,7 +73,7 @@ def fetch(sym, pledge_override):
     m["roic_wacc"] = roic - wacc
     m["roe"] = g(ni)/g(eq) if g(eq) else np.nan
     m["opm"] = g(ebit)/g(rev) if g(rev) else np.nan
-    # --- Valuation: MULTI-CANDIDATE CROSS-VALIDATION (v2.5) ---
+    # --- Valuation: multi-candidate cross-validation ---
     m["pe"] = info.get("trailingPE") or np.nan
     ev_c = []
     e2e = info.get("enterpriseToEbitda")
@@ -72,25 +81,25 @@ def fetch(sym, pledge_override):
     ev_raw, eb_info = info.get("enterpriseValue"), info.get("ebitda")
     if ok(ev_raw) and ok(eb_info) and eb_info: ev_c.append(ev_raw/eb_info)
     m["ev"] = next((c for c in ev_c if 0 < c <= 60), np.nan)
-
-    o, cx = (g(ocf), g(capex)) if len(ocf) else (np.nan, np.nan)
-    fcf_stmt = (o + (0.0 if not ok(cx) else cx)) if ok(o) else np.nan
+    o, cx = g(ocf), g(capex)
+    if len(fcf_row): fcf_stmt = g(fcf_row)
+    elif ok(o):      fcf_stmt = o + (0.0 if not ok(cx) else cx)
+    else:            fcf_stmt = np.nan
     rev_stmt_v = g(rev)
     info_fcf, info_rev = info.get("freeCashflow"), info.get("totalRevenue")
     cands = []
-    if ok(fcf_stmt) and ok(mcap) and mcap: cands.append(fcf_stmt/mcap)          # statement / info
-    if ok(info_fcf) and ok(mcap) and mcap: cands.append(info_fcf/mcap)          # info / info
+    if ok(fcf_stmt) and ok(mcap) and mcap: cands.append(fcf_stmt/mcap)
+    if ok(info_fcf) and ok(mcap) and mcap: cands.append(info_fcf/mcap)
     if ok(fcf_stmt) and ok(rev_stmt_v) and rev_stmt_v and ok(info_rev) and ok(mcap) and mcap:
-        cands.append((fcf_stmt/rev_stmt_v)*(info_rev/mcap))                     # unit-proof hybrid
+        cands.append((fcf_stmt/rev_stmt_v)*(info_rev/mcap))
     m["fcf_yield"] = next((c for c in cands if 0.001 <= c <= 0.30), np.nan)
-    fcf = fcf_stmt
     # --- Cash flow & forensics ---
     cogs_v = g(cogs)
-    if not ok(cogs_v) or cogs_v <= 0: cogs_v = g(rev)
-    m["ccc"] = (g(inv)/cogs_v*365 + g(recv)/g(rev)*365 - g(pay)/cogs_v*365) \
+    if not ok(cogs_v) or cogs_v <= 0: cogs_v = rev_stmt_v
+    m["ccc"] = (g(inv)/cogs_v*365 + g(recv)/rev_stmt_v*365 - g(pay)/cogs_v*365) \
                if (ok(cogs_v) and ok(rev_stmt_v) and rev_stmt_v != 0) else np.nan
-    m["fcf_sales"] = fcf/rev_stmt_v if (ok(fcf) and ok(rev_stmt_v) and rev_stmt_v != 0) else np.nan
-    m["accruals"] = (g(ni)-g(ocf))/g(assets) if (ok(g(ni)) and ok(g(ocf)) and ok(g(assets)) and g(assets)) else np.nan
+    m["fcf_sales"] = fcf_stmt/rev_stmt_v if (ok(fcf_stmt) and ok(rev_stmt_v) and rev_stmt_v != 0) else np.nan
+    m["accruals"] = (g(ni)-o)/g(assets) if (ok(g(ni)) and ok(o) and ok(g(assets)) and g(assets)) else np.nan
     # --- Health / governance / momentum ---
     m["de"] = (g(debt)/g(eq)) if g(eq) else (info.get("debtToEquity", 0) or 0)/100
     m["int_cov"] = g(ebit)/g(intr) if (ok(g(intr)) and g(intr) > 0) else 999
@@ -108,12 +117,19 @@ def main():
     uni = fetch_universe()
     rows = []
     for _, r in uni.iterrows():
-        try:
-            m = fetch(r.ticker, 0.0)
-            m.update(ticker=r.ticker, in_n100=bool(r.in_n100), in_s30=bool(r.in_s30))
-            rows.append(m); time.sleep(SLEEP)
-        except Exception as ex:
-            print(f"SKIP {r.ticker}: {ex}")
+        m = None
+        for attempt in (1, 2):                       # retry on incomplete data
+            try:
+                m = fetch(r.ticker, 0.0)
+                if sum(ok(m.get(k)) for k in ("roce","opm","pe","fcf_yield")) >= 3:
+                    break
+                print(f"RETRY {r.ticker} (incomplete data, attempt {attempt})")
+                time.sleep(3)
+            except Exception as ex:
+                print(f"SKIP {r.ticker}: {ex}"); m = None; break
+        if m is None: continue
+        m.update(ticker=r.ticker, in_n100=bool(r.in_n100), in_s30=bool(r.in_s30))
+        rows.append(m); time.sleep(SLEEP)
     df = pd.DataFrame(rows)
     df["bfsi"] = df.sector == BFSI_SECTOR
     live = df[~df.bfsi].copy()
@@ -124,9 +140,12 @@ def main():
         live[k+"_s"] = (pct*100 if k in HIGHER_BETTER else (1-pct)*100).fillna(50).clip(0,100)
     live["c_plus"] = sum(live[k+"_s"]*w for k, w in WEIGHTS.items())
     live["val_pillar"] = (live.rel_pe_s*.07 + live.rel_ev_s*.05 + live.fcf_yield_s*.08)/.20
-    live["recommendation"] = live.apply(
-        lambda x: "SELL" if x.c_plus < 65 else
-        ("BUY" if x.c_plus >= 80 and x.val_pillar >= 75 else "HOLD/WAIT"), axis=1)
+    def rec(x):                                       # RECALIBRATED v2.6
+        red = (x.pledge > 5) or (ok(x.de) and x.de > 2.5) or (ok(x.accruals) and x.accruals > 0.10)
+        if red or x.c_plus < 50: return "SELL"
+        if x.c_plus >= 80 and x.val_pillar >= 75: return "BUY"
+        return "HOLD/WAIT"
+    live["recommendation"] = live.apply(rec, axis=1)
     def reason(x):
         med = x.pe/x.rel_pe if (ok(x.rel_pe) and x.rel_pe != 0) else np.nan
         return (f"ROCE {fmt_pct(x.roce)}, P/E {fmt_x(x.pe)} vs sector {fmt_x(med)}, "
