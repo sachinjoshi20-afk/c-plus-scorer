@@ -1,0 +1,21 @@
+:root{--bg:#0b1020;--card:#131a33;--txt:#e6e9f5;--mut:#8b93b0;--grn:#22c55e;--yel:#facc15;--red:#f43f5e}
+*{box-sizing:border-box} body{margin:0;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
+header{padding:24px 28px 8px} h1{margin:0;font-size:26px} h1 span{font-size:13px;color:var(--mut);font-weight:400;margin-left:10px}
+#updated{color:var(--mut);margin-top:4px} .summary{margin-top:8px;font-weight:600}
+main{padding:12px 28px 40px}
+.controls{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+.controls input,.controls select{background:var(--card);color:var(--txt);border:1px solid #2a3354;border-radius:8px;padding:8px 12px;font-size:14px}
+.controls input{flex:1;min-width:220px}
+.tablewrap{overflow-x:auto;border:1px solid #2a3354;border-radius:12px}
+table{width:100%;border-collapse:collapse;background:var(--card);min-width:900px}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #222b4a;vertical-align:top}
+thead th{position:sticky;top:0;background:#182042;cursor:pointer;user-select:none;font-size:12px;text-transform:uppercase;letter-spacing:.4px;color:var(--mut)}
+tbody tr:hover{background:#1a2348}
+.badge{font-size:10px;color:var(--mut);border:1px solid #2a3354;border-radius:4px;padding:1px 4px;margin-left:4px}
+.score{white-space:nowrap} .bar{display:inline-block;height:8px;border-radius:4px;margin-right:8px;vertical-align:middle;
+  background:linear-gradient(90deg,var(--red),var(--yel),var(--grn))}
+.pill{padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;white-space:nowrap}
+.pill.buy{background:#052e16;color:#86efac} .pill.hold{background:#42300a;color:#fde68a}
+.pill.sell{background:#4c0519;color:#fda4af} .pill.na{background:#1e293b;color:#94a3b8}
+.reason{color:var(--mut);font-size:12px;max-width:420px}
+.disclaimer{color:var(--mut);font-size:12px;margin-top:18px;max-width:800px}
