@@ -1,3 +1,10 @@
 yfinance
 pandas
 numpy
+yfinance
+pandas
+numpy
+lxml
+html5lib
+beautifulsoup4
+requests
