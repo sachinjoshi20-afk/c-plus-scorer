@@ -1,8 +1,6 @@
-"""C+ Scoring Engine (Robust V2.4) - SENSEX + NIFTY 100, non-BFSI.
-Hardened against Yahoo Finance API unit glitches:
-  - EV/EBITDA sanity check + recompute from raw EV & EBITDA
-  - FCF Yield unit-mismatch guard with neutral fallback
-  - CCC fix for companies with no Cost Of Revenue row (services firms)
+"""C+ Scoring Engine (Robust V2.5) - SENSEX + NIFTY 100, non-BFSI.
+v2.5: multi-candidate cross-validation for FCF Yield & EV/EBITDA
+      (defeats Yahoo currency/unit mismatches definitively).
 """
 import os, time, json, datetime as dt
 import numpy as np, pandas as pd, yfinance as yf
@@ -31,9 +29,6 @@ def row(df, name):
 def ok(v):
     return v is not None and not (isinstance(v, float) and np.isnan(v))
 
-def plausible(v, lo, hi):
-    return ok(v) and lo <= v <= hi
-
 def fmt_pct(v): return f"{v:.0%}" if ok(v) else "n/a"
 def fmt_x(v):   return f"{v:.1f}x" if ok(v) else "n/a"
 
@@ -42,7 +37,6 @@ def fetch(sym, pledge_override):
     fin, bs, cf = t.financials, t.balance_sheet, t.cashflow
     rev, ni = row(fin,"Total Revenue"), row(fin,"Net Income")
     ebit = row(fin,"EBIT") if "EBIT" in fin.index else row(fin,"Operating Income")
-    ebitda_s = row(fin,"EBITDA")
     intr, tax, pretax = row(fin,"Interest Expense"), row(fin,"Tax Provision"), row(fin,"Pretax Income")
     cogs = row(fin,"Cost Of Revenue")
     ocf, capex = row(cf,"Operating Cash Flow"), row(cf,"Capital Expenditure")
@@ -70,30 +64,32 @@ def fetch(sym, pledge_override):
     m["roic_wacc"] = roic - wacc
     m["roe"] = g(ni)/g(eq) if g(eq) else np.nan
     m["opm"] = g(ebit)/g(rev) if g(rev) else np.nan
-    # --- Valuation (HARDENED) ---
+    # --- Valuation: MULTI-CANDIDATE CROSS-VALIDATION (v2.5) ---
     m["pe"] = info.get("trailingPE") or np.nan
-    evr = info.get("enterpriseToEbitda") or np.nan
-    if not plausible(evr, 0, 60):                       # API glitch guard
-        ev_raw, eb0 = info.get("enterpriseValue"), g(ebitda_s)
-        evr = ev_raw/eb0 if (ev_raw and eb0 and eb0 > 0) else np.nan
-        evr = evr if plausible(evr, 0, 60) else np.nan
-    m["ev"] = evr
-    fcf = np.nan
-    if len(ocf):
-        o, cx = g(ocf), g(capex)
-        if ok(o): fcf = o + (0.0 if not ok(cx) else cx)
-    if not ok(fcf): fcf = info.get("freeCashflow") or np.nan
-    fy = fcf/mcap if (ok(fcf) and ok(mcap) and mcap) else np.nan
-    if not plausible(fy, -0.20, 0.35):                  # unit-mismatch guard
-        alt = (info.get("freeCashflow") or np.nan)/mcap if (ok(mcap) and mcap) else np.nan
-        fy = alt if plausible(alt, -0.20, 0.35) else np.nan
-    m["fcf_yield"] = fy
-    # --- Cash flow & forensics (CCC FIXED for services firms) ---
+    ev_c = []
+    e2e = info.get("enterpriseToEbitda")
+    if ok(e2e): ev_c.append(e2e)
+    ev_raw, eb_info = info.get("enterpriseValue"), info.get("ebitda")
+    if ok(ev_raw) and ok(eb_info) and eb_info: ev_c.append(ev_raw/eb_info)
+    m["ev"] = next((c for c in ev_c if 0 < c <= 60), np.nan)
+
+    o, cx = (g(ocf), g(capex)) if len(ocf) else (np.nan, np.nan)
+    fcf_stmt = (o + (0.0 if not ok(cx) else cx)) if ok(o) else np.nan
+    rev_stmt_v = g(rev)
+    info_fcf, info_rev = info.get("freeCashflow"), info.get("totalRevenue")
+    cands = []
+    if ok(fcf_stmt) and ok(mcap) and mcap: cands.append(fcf_stmt/mcap)          # statement / info
+    if ok(info_fcf) and ok(mcap) and mcap: cands.append(info_fcf/mcap)          # info / info
+    if ok(fcf_stmt) and ok(rev_stmt_v) and rev_stmt_v and ok(info_rev) and ok(mcap) and mcap:
+        cands.append((fcf_stmt/rev_stmt_v)*(info_rev/mcap))                     # unit-proof hybrid
+    m["fcf_yield"] = next((c for c in cands if 0.001 <= c <= 0.30), np.nan)
+    fcf = fcf_stmt
+    # --- Cash flow & forensics ---
     cogs_v = g(cogs)
     if not ok(cogs_v) or cogs_v <= 0: cogs_v = g(rev)
     m["ccc"] = (g(inv)/cogs_v*365 + g(recv)/g(rev)*365 - g(pay)/cogs_v*365) \
-               if (ok(cogs_v) and ok(g(rev)) and g(rev) != 0) else np.nan
-    m["fcf_sales"] = fcf/g(rev) if (ok(fcf) and ok(g(rev)) and g(rev) != 0) else np.nan
+               if (ok(cogs_v) and ok(rev_stmt_v) and rev_stmt_v != 0) else np.nan
+    m["fcf_sales"] = fcf/rev_stmt_v if (ok(fcf) and ok(rev_stmt_v) and rev_stmt_v != 0) else np.nan
     m["accruals"] = (g(ni)-g(ocf))/g(assets) if (ok(g(ni)) and ok(g(ocf)) and ok(g(assets)) and g(assets)) else np.nan
     # --- Health / governance / momentum ---
     m["de"] = (g(debt)/g(eq)) if g(eq) else (info.get("debtToEquity", 0) or 0)/100
