@@ -1,4 +1,9 @@
-"""C+ Scoring Engine (Robust V2) - SENSEX + NIFTY 100, non-BFSI."""
+"""C+ Scoring Engine (Robust V2.4) - SENSEX + NIFTY 100, non-BFSI.
+Hardened against Yahoo Finance API unit glitches:
+  - EV/EBITDA sanity check + recompute from raw EV & EBITDA
+  - FCF Yield unit-mismatch guard with neutral fallback
+  - CCC fix for companies with no Cost Of Revenue row (services firms)
+"""
 import os, time, json, datetime as dt
 import numpy as np, pandas as pd, yfinance as yf
 from universe import fetch_universe
@@ -23,11 +28,21 @@ def row(df, name):
     except Exception:
         return pd.Series(dtype=float)
 
+def ok(v):
+    return v is not None and not (isinstance(v, float) and np.isnan(v))
+
+def plausible(v, lo, hi):
+    return ok(v) and lo <= v <= hi
+
+def fmt_pct(v): return f"{v:.0%}" if ok(v) else "n/a"
+def fmt_x(v):   return f"{v:.1f}x" if ok(v) else "n/a"
+
 def fetch(sym, pledge_override):
     t = yf.Ticker(sym); info = t.info
     fin, bs, cf = t.financials, t.balance_sheet, t.cashflow
     rev, ni = row(fin,"Total Revenue"), row(fin,"Net Income")
     ebit = row(fin,"EBIT") if "EBIT" in fin.index else row(fin,"Operating Income")
+    ebitda_s = row(fin,"EBITDA")
     intr, tax, pretax = row(fin,"Interest Expense"), row(fin,"Tax Provision"), row(fin,"Pretax Income")
     cogs = row(fin,"Cost Of Revenue")
     ocf, capex = row(cf,"Operating Cash Flow"), row(cf,"Capital Expenditure")
@@ -37,32 +52,52 @@ def fetch(sym, pledge_override):
     assets = row(bs,"Total Assets")
     g = lambda s: float(s.iloc[0]) if len(s) else np.nan
     m = {}
+    # --- Growth ---
     m["profit_yoy"] = ni.iloc[0]/ni.iloc[1]-1 if len(ni)>=2 else np.nan
     m["profit_3y"]  = (ni.iloc[0]/ni.iloc[3])**(1/3)-1 if len(ni)>=4 else np.nan
     m["sales_yoy"]  = rev.iloc[0]/rev.iloc[1]-1 if len(rev)>=2 else np.nan
     m["sales_3y"]   = (rev.iloc[0]/rev.iloc[3])**(1/3)-1 if len(rev)>=4 else np.nan
+    # --- Profitability ---
     ce = g(debt)+g(eq)-g(cash)
     m["roce"] = g(ebit)/ce if ce else np.nan
     tax_rt = g(tax)/g(pretax) if g(pretax) else FALLBACK_TAX
     roic = g(ebit)*(1-tax_rt)/ce if ce else np.nan
     mcap = info.get("marketCap") or np.nan
-    e, d = mcap or 0, g(debt) or 0
-    re = RISK_FREE + (info.get("beta") or 1.0)*EQUITY_RISK_PREMIUM
+    e, d = mcap or 0.0, g(debt) or 0.0
+    re_ = RISK_FREE + (info.get("beta") or 1.0)*EQUITY_RISK_PREMIUM
     rd = (g(intr)/d) if d else FALLBACK_COST_OF_DEBT
-    wacc = (e/(e+d)*re + d/(e+d)*rd*(1-tax_rt)) if (e+d) else re
+    wacc = (e/(e+d)*re_ + d/(e+d)*rd*(1-tax_rt)) if (e+d) else re_
     m["roic_wacc"] = roic - wacc
     m["roe"] = g(ni)/g(eq) if g(eq) else np.nan
     m["opm"] = g(ebit)/g(rev) if g(rev) else np.nan
-    m["pe"]  = info.get("trailingPE") or np.nan
-    m["ev"]  = info.get("enterpriseToEbitda") or np.nan
-    fcf = (g(ocf)+g(capex)) if len(ocf) else (info.get("freeCashflow") or np.nan)
-    m["fcf_yield"] = fcf/mcap if mcap else np.nan
-    c = g(cogs) if g(cogs) else g(rev)
-    m["ccc"] = (g(inv)/c*365 + g(recv)/g(rev)*365 - g(pay)/c*365) if c and g(rev) else np.nan
-    m["fcf_sales"] = fcf/g(rev) if g(rev) else np.nan
-    m["accruals"] = (g(ni)-g(ocf))/g(assets) if g(assets) else np.nan
-    m["de"] = (g(debt)/g(eq)) if g(eq) else (info.get("debtToEquity", 0)/100)
-    m["int_cov"] = g(ebit)/g(intr) if g(intr) and g(intr) > 0 else 999
+    # --- Valuation (HARDENED) ---
+    m["pe"] = info.get("trailingPE") or np.nan
+    evr = info.get("enterpriseToEbitda") or np.nan
+    if not plausible(evr, 0, 60):                       # API glitch guard
+        ev_raw, eb0 = info.get("enterpriseValue"), g(ebitda_s)
+        evr = ev_raw/eb0 if (ev_raw and eb0 and eb0 > 0) else np.nan
+        evr = evr if plausible(evr, 0, 60) else np.nan
+    m["ev"] = evr
+    fcf = np.nan
+    if len(ocf):
+        o, cx = g(ocf), g(capex)
+        if ok(o): fcf = o + (0.0 if not ok(cx) else cx)
+    if not ok(fcf): fcf = info.get("freeCashflow") or np.nan
+    fy = fcf/mcap if (ok(fcf) and ok(mcap) and mcap) else np.nan
+    if not plausible(fy, -0.20, 0.35):                  # unit-mismatch guard
+        alt = (info.get("freeCashflow") or np.nan)/mcap if (ok(mcap) and mcap) else np.nan
+        fy = alt if plausible(alt, -0.20, 0.35) else np.nan
+    m["fcf_yield"] = fy
+    # --- Cash flow & forensics (CCC FIXED for services firms) ---
+    cogs_v = g(cogs)
+    if not ok(cogs_v) or cogs_v <= 0: cogs_v = g(rev)
+    m["ccc"] = (g(inv)/cogs_v*365 + g(recv)/g(rev)*365 - g(pay)/cogs_v*365) \
+               if (ok(cogs_v) and ok(g(rev)) and g(rev) != 0) else np.nan
+    m["fcf_sales"] = fcf/g(rev) if (ok(fcf) and ok(g(rev)) and g(rev) != 0) else np.nan
+    m["accruals"] = (g(ni)-g(ocf))/g(assets) if (ok(g(ni)) and ok(g(ocf)) and ok(g(assets)) and g(assets)) else np.nan
+    # --- Health / governance / momentum ---
+    m["de"] = (g(debt)/g(eq)) if g(eq) else (info.get("debtToEquity", 0) or 0)/100
+    m["int_cov"] = g(ebit)/g(intr) if (ok(g(intr)) and g(intr) > 0) else 999
     m["pledge"] = pledge_override
     try:
         px = t.history(period="1y")["Close"]
@@ -96,9 +131,11 @@ def main():
     live["recommendation"] = live.apply(
         lambda x: "SELL" if x.c_plus < 65 else
         ("BUY" if x.c_plus >= 80 and x.val_pillar >= 75 else "HOLD/WAIT"), axis=1)
-    live["reason"] = live.apply(lambda x:
-        f"ROCE {x.roce:.0%}, P/E {x.pe:.1f}x vs sector {x.pe/x.rel_pe:.1f}x, "
-        f"FCF yld {x.fcf_yield:.1%}, D/E {x.de:.2f}", axis=1)
+    def reason(x):
+        med = x.pe/x.rel_pe if (ok(x.rel_pe) and x.rel_pe != 0) else np.nan
+        return (f"ROCE {fmt_pct(x.roce)}, P/E {fmt_x(x.pe)} vs sector {fmt_x(med)}, "
+                f"FCF yld {fmt_pct(x.fcf_yield)}, D/E {x.de:.2f}")
+    live["reason"] = live.apply(reason, axis=1)
     df = df.merge(live[["ticker","c_plus","recommendation","reason"]], on="ticker", how="left")
     df.loc[df.bfsi, ["recommendation","reason"]] = ["NOT SCORED (BFSI)", "BFSI engine (v3) pending"]
     df["badge"] = np.where(df.in_s30, "[S30·N100]", "[N100]")
